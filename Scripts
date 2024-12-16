@@ -16,3 +16,164 @@ import pandas as pd
 from tqdm.notebook import tqdm
 from plottable import Table,ColDef
 import matplotlib.pyplot as plt
+# Paths to input files
+bathy_raster_path = r'E:\Spyder\SAT_MBES\Rasters\TIDs\GEB2024_bathy_v1_sea_reclass.tif'
+eez_poly_path = r"E:\Spyder\SAT_MBES\Rasters\TIDs\World_EEZ_Depth_Class.shp"
+ocean_depth_poly_path = r"E:\Spyder\SAT_MBES\Rasters\TIDs\World_Oceans_Seas.shp"
+#High_seas_poly_path = r"E:\Spyder\SAT_MBES\Rasters\TIDs\World_Oceans_Seas.shp"
+grid_path = r"E:\Spyder\SAT_MBES\Rasters\TIDs\20deg_grid.gpkg"
+years = ['2019', '2020', '2021', '2022', '2023', '2024']
+
+# Output folders for saving results
+output_folder_dfs = r'E:\Spyder\SAT_MBES\Rasters/output_dfs'
+output_folder_images = r'E:\Spyder\SAT_MBES\Rasters/output_images'
+
+# Load input data for processing
+bathy_raster = ras.open(bathy_raster_path)
+eez_poly = gpd.read_file(eez_poly_path)
+ocean_depth_poly = gpd.read_file(ocean_depth_poly_path)
+grid = gpd.read_file(grid_path)
+
+# Dictionary to map EEZ and ocean names to unique codes for raster band identification
+eez_dict = {name: code for code, name in enumerate(eez_poly.SOVEREIGN1.unique())}
+ocean_dict = {name: code for code, name in enumerate(ocean_depth_poly.name.unique())}
+
+# Reproject shapefiles to match the CRS of the bathymetry raster
+eez_poly = eez_poly.to_crs(bathy_raster.crs)
+ocean_depth_poly = ocean_depth_poly.to_crs(bathy_raster.crs)
+
+# Process each tile in the grid iteratively
+for i_tile in tqdm(range(grid.shape[0]), desc="Processing Tiles", unit='tile'):
+    tile_test = grid.iloc[[i_tile]]  # Select current tile for processing
+
+    for year_in in years:
+        # Load the method raster for the current year
+        meth_raster_path = rf'E:\Spyder\SAT_MBES\Rasters\TIDs\GEBCO_{year_in}_TID.tif'
+        meth_raster = ras.open(meth_raster_path)
+
+        # Define output paths for the DataFrame and image
+        out_folder_df = os.path.join(output_folder_dfs, f"out_dfs_{year_in}")
+        os.makedirs(out_folder_df, exist_ok=True)
+        out_folder_image = os.path.join(output_folder_images, f"out_tiles_{year_in}")
+        os.makedirs(out_folder_image, exist_ok=True)
+
+        # Read data from bathymetry and method rasters
+        bathy = bathy_raster.read(1)
+        meth = meth_raster.read(1)
+
+        print(f"WORKING ON TILE: {i_tile}")
+
+        # Step 1: Intersect the current tile with EEZ and ocean polygons for subsetting
+        eez_inter = eez_poly[eez_poly.intersects(tile_test.geometry.iloc[0])]
+        eez_inter_dissolved = eez_inter.dissolve(by="SOVEREIGN1").reset_index()
+        ocean_inter = ocean_depth_poly[ocean_depth_poly.intersects(tile_test.geometry.iloc[0])]
+
+        # Prepare list to hold clipped rasters
+        images = []
+
+        # Step 2: Clip both method and bathymetry rasters to tile extent
+        rasters = [meth_raster, bathy_raster]
+        for raster_in in rasters:
+            geom = tile_test.to_crs(raster_in.crs).iloc[0].loc['geometry']
+            out_image, out_transform = mask(raster_in, [geom], crop=True)
+            out_meta = raster_in.meta.copy()
+
+            # Update metadata to match clipped raster dimensions and transformation
+            out_meta.update({
+                "driver": "GTiff",
+                "height": out_image.shape[1],
+                "width": out_image.shape[2],
+                "transform": out_transform
+            })
+
+            # Write the clipped raster data to an in-memory file
+            single_memfile = MemoryFile()
+            with single_memfile.open(**out_meta) as mem_writer:
+                mem_writer.write(out_image)
+
+            # Reopen in-memory file to append it to the images list
+            mem_reader = single_memfile.open()
+            images.append(mem_reader)
+
+        # Step 3: Load clipped rasters as xarray DataArrays
+        xds_meth = xr.open_dataarray(images[0].name, engine='rasterio')
+        xds_depth = xr.open_dataarray(images[1].name, engine='rasterio')
+
+        # Step 4: Reproject depth raster to match the method raster
+        xds_depth_match = xds_depth.rio.reproject_match(xds_meth, resampling=ras.enums.Resampling.nearest)
+
+        # Step 5: Process intersected EEZ polygons and assign each a unique code
+        if eez_inter_dissolved.shape[0] > 0:
+            clips_svrn = []
+            for sovereign_state in eez_inter_dissolved.SOVEREIGN1.unique():
+                # Clip method raster for each EEZ region
+                eez_zone_sovr_geom = [mapping(eez_inter_dissolved.query(f"SOVEREIGN1 == '{sovereign_state}'").iloc[0]['geometry'])]
+                clipped_tmp = xds_meth.rio.clip(geometries=eez_zone_sovr_geom, crs=xds_meth.rio.crs, drop=False)
+                clipped_tmp = clipped_tmp.where(np.isnan(clipped_tmp), eez_dict[sovereign_state])
+                clips_svrn.append(clipped_tmp)
+
+            # Stack results into a DataArray for EEZ regions
+            stacked_da_svrn = xr.concat(clips_svrn, dim="sovereign_state")
+            sovereign_band = stacked_da_svrn.max(dim="sovereign_state", skipna=True)
+        else:
+            sovereign_band = xds_meth.copy()
+            sovereign_band[:] = np.nan
+
+        # Step 6: Process intersected ocean polygons and assign each a unique code
+        if ocean_inter.shape[0] > 0:
+            clips_ocean = []
+            for i in range(ocean_inter.shape[0]):
+                ocean_i = ocean_inter.iloc[[i]]
+                ocean_name_i = ocean_i['name'].values[0]
+                ocean_geom_i = [mapping(ocean_i.iloc[0]['geometry'])]
+
+                clipped_tmp = xds_meth.rio.clip(geometries=ocean_geom_i, crs=xds_meth.rio.crs, drop=False)
+                clipped_tmp = clipped_tmp.where(np.isnan(clipped_tmp), ocean_dict[ocean_name_i])
+                clips_ocean.append(clipped_tmp)
+
+            # Stack results into a DataArray for ocean regions
+            stacked_da_ocean = xr.concat(clips_ocean, dim="ocean")
+            ocean_band = stacked_da_ocean.max(dim="ocean", skipna=True)
+        else:
+            ocean_band = xds_meth.copy()
+            ocean_band[:] = np.nan
+
+        # Step 7: Combine all data into a multi-band xarray DataArray
+        band_names = ['method', 'depth', 'eez', 'ocean']
+        stacked = xr.concat([xds_meth, xds_depth_match, sovereign_band, ocean_band], dim='band')
+        stacked = stacked.assign_coords(band=band_names)
+
+        # Set description attributes for each band
+        for i, band_name in enumerate(band_names):
+            stacked[i].attrs['description'] = band_name
+
+        # Step 8: Reproject to Mollweide projection
+        stacked_mollweide = stacked.rio.reproject("ESRI:54009")
+
+        # Step 9: Reshape data to find unique pixel combinations
+        reshaped = stacked_mollweide.stack(pixel=("y", "x")).transpose("band", "pixel").values
+        reshaped_no_nan = np.nan_to_num(reshaped, nan=-9999)
+        unique_combinations, counts = np.unique(reshaped_no_nan.T, axis=0, return_counts=True)
+
+        # Step 10: Create a DataFrame to store unique combinations and pixel area
+        df = pd.DataFrame(unique_combinations, columns=['method', 'depth', 'eez', 'ocean'])
+        df['num_pixels'] = counts
+        df.replace(-9999, np.nan, inplace=True)
+        df = df[['num_pixels', 'ocean', 'depth', 'method', 'eez']]
+
+        # Calculate pixel area and area in km²
+        transform = stacked_mollweide.rio.transform()
+        pixel_width, pixel_height = transform[0], abs(transform[4])
+        pixel_area_m2 = pixel_width * pixel_height
+        df['area_m2'] = df['num_pixels'] * pixel_area_m2
+        df['area_km2'] = df['area_m2'] / 1e6
+
+        # Step 11: Export stacked raster as GeoTIFF and save DataFrame
+        out_image_path = os.path.join(out_folder_image, f"{i_tile}_tile_multistack.tif")
+        with ras.open(out_image_path, 'w', driver='GTiff', crs=stacked.rio.crs,
+                      transform=stacked.rio.transform(), width=stacked.rio.width,
+                      height=stacked.rio.height, count=stacked.shape[0], dtype=stacked.dtype) as dst:
+            for i in range(stacked.shape[0]):
+                dst.write(stacked[i, :, :].values, i + 1)
+                dst.set_band_description(i + 1, stacked[i].attrs['description'])
+
