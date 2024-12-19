@@ -4,7 +4,6 @@ import glob
 import rioxarray as rx
 import xarray as xr
 from shapely.geometry import mapping
-
 import rasterio as ras
 from rasterio.features import geometry_mask
 from rasterio.io import MemoryFile
@@ -17,11 +16,11 @@ from tqdm.notebook import tqdm
 from plottable import Table,ColDef
 import matplotlib.pyplot as plt
 # Paths to input files
-bathy_raster_path = r'E:\Spyder\SAT_MBES\Rasters\TIDs\GEB2024_bathy_v1_sea_reclass.tif'
-eez_poly_path = r"E:\Spyder\SAT_MBES\Rasters\TIDs\World_EEZ_Depth_Class.shp"
-ocean_depth_poly_path = r"E:\Spyder\SAT_MBES\Rasters\TIDs\World_Oceans_Seas.shp"
-#High_seas_poly_path = r"E:\Spyder\SAT_MBES\Rasters\TIDs\World_Oceans_Seas.shp"
-grid_path = r"E:\Spyder\SAT_MBES\Rasters\TIDs\20deg_grid.gpkg"
+bathy_raster_path = r'bathymetric_raster'
+eez_poly_path = r"EEZ"
+ocean_depth_poly_path = r"Ocean-depth"
+High_seas_poly_path = r"High-seas"
+grid_path = r"Grid"
 years = ['2019', '2020', '2021', '2022', '2023', '2024']
 
 # Output folders for saving results
